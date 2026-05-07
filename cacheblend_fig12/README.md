@@ -70,10 +70,11 @@ CacheBlend의 Fig.12는 RAG 형태의 멀티-document 입력에서 **KV 캐시 �
 
 ```
 cacheblend_fig12/
-├── README.md          ← 본 문서
-├── build_prompts.py   ← 빌드 스크립트
-├── requirements.txt   ← Python 의존성
-└── prompts.jsonl      ← 결과 (200줄, ~1.2 MB)
+├── README.md                  ← 본 문서
+├── build_prompts.py           ← 프롬프트 빌드 스크립트 (MuSiQue → prompts.jsonl)
+├── convert_to_cacheblend.py   ← prompts.jsonl → CacheBlend 입력 포맷 변환기 (§8.4 참조)
+├── requirements.txt           ← Python 의존성
+└── prompts.jsonl              ← 결과 (200줄, ~1.2 MB)
 ```
 
 ## 5. `prompts.jsonl` 레코드 스키마
@@ -260,6 +261,97 @@ def em(pred, golds):
 위한 장치입니다. 이 때문에 같은 6개 문서 집합이라도 재사용 가능한 KV는 *위치별*로
 제한적이라는 점이 CacheBlend가 강조하는 어려움이고, 본 데이터셋은 그 어려움을
 보존합니다.
+
+### 8.4 CacheBlend 공식 스크립트(`example/blend_musique.py`)와 함께 쓰기
+
+[YaoJiayi/CacheBlend](https://github.com/YaoJiayi/CacheBlend) 레포는 vLLM fork와
+함께 `example/blend_musique.py`라는 실험 스크립트를 제공합니다. 이 스크립트는
+**자체 포맷의 JSON**을 기대하므로, `prompts.jsonl`을 변환한 뒤 한 줄만 패치하면
+바로 돌릴 수 있습니다.
+
+#### 스키마 매핑
+
+| 항목 | 우리 (`prompts.jsonl`) | CacheBlend (`inputs/musique_*.json`) |
+|---|---|---|
+| 파일 형식 | JSONL | JSON list |
+| 문서 | `prompt_parts.docs[i]` (str) | `ctxs[i] = {"title": str, "text": str}` |
+| 질문 | `question` | `question` |
+| 정답 | `answer` (+ `answer_aliases`) | `answers` (list[str]) |
+
+#### 1단계 — 변환
+
+```bash
+.venv/bin/python convert_to_cacheblend.py \
+  --output /path/to/CacheBlend/inputs/musique_ours.json
+```
+
+기본 입력은 같은 디렉터리의 `prompts.jsonl`. 출력 레코드 스키마:
+
+```json
+{
+  "question": "Who is the spouse of the Green performer?",
+  "answers":  ["Miquette Giraudy"],
+  "ctxs": [
+    {"title": "", "text": "List of show business families. ..."},
+    {"title": "", "text": "Miquette Giraudy. Miquette Giraudy ..."}
+  ]
+}
+```
+
+> `title`은 의도적으로 비웁니다. 우리 docs는 이미 `"{title}. {paragraph_text}"`
+> 형태로 만들어져 있고, CacheBlend의 `build_qa_prompt()`가 다시
+> `f"{title}\n\n{text}\n\n"`로 합치기 때문에, title을 채우면 제목이 두 번
+> 들어갑니다. 빈 title이면 `"\n\n{text}\n\n"`로 깔끔하게 떨어집니다.
+>
+> `answers`에는 정답과 `answer_aliases`를 모두 담습니다. CacheBlend의 채점은
+> `max([compute_f1(pred, a, tok) for a in answers])`이므로 alias가 많을수록
+> F1 평가가 정확해집니다.
+
+#### 2단계 — `blend_musique.py` 한 줄 패치
+
+```python
+# CacheBlend/example/blend_musique.py 의 9번째 줄
+- eval_dataset = load_dataset("inputs/musique_s.json")
++ eval_dataset = load_dataset("inputs/musique_ours.json")
+```
+
+이외에는 손대지 않습니다. 스크립트가 자체적으로:
+- 문서 → `[doc_chunk_ids]`로 토크나이즈
+- Mistral `[INST] / [/INST]` 토큰을 앞뒤에 부착
+- `cache_fuse_metadata['collect'/'check']` 토글로 **CacheBlend (KV 재사용)** 와
+  **vanilla full prefill** 를 같은 입력으로 두 번 돌리고 TTFT, F1 측정
+
+#### 3단계 — 실행 (GPU 환경)
+
+```bash
+cd /path/to/CacheBlend
+# vllm_blend 설치는 그쪽 README 참조
+python example/blend_musique.py
+```
+
+기대 출력 끝부분:
+
+```
+---------------Result Summary---------------------
+TTFT with cache: <초>
+TTFT with full prefill: <초>
+F1 with cache: <0~1>
+F1 with full prefill: <0~1>
+```
+
+#### 주의
+
+- **모델 고정**: `mistralai/Mistral-7B-Instruct-v0.2`. 다른 모델로 바꾸려면
+  `blend_musique.py` L46/L54의 `[INST]`/`[/INST]` 토큰 ID(`[733, 16289, 28793]`,
+  `[733, 28748, 16289, 28793]`)를 해당 토크나이저로 다시 인코딩해야 합니다.
+- **시스템 프롬프트는 CacheBlend 원본을 사용**: §3에서 정한 우리 시스템 프롬프트
+  (`"You are a helpful assistant. Use the following documents to answer the question."`)
+  는 이 경로에서 사용되지 않습니다. CacheBlend 측 `prefix_prompt`/`query_prompt`
+  (`blend_musique.py` L17-18)가 적용됩니다 — 즉 `prompts.jsonl`의 `prompt` 필드 자체가
+  아니라 docs/question/answer만 재사용됩니다. 같은 시스템 프롬프트로 통일하고 싶다면
+  L17-18을 우리 문구로 직접 교체하세요.
+- **GPU 필요**: vLLM이 macOS에서는 동작하지 않습니다. 변환·패치까지가 로컬에서
+  가능한 범위.
 
 ## 9. 파라미터를 바꾸고 싶다면
 
