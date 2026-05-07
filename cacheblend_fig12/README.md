@@ -72,9 +72,13 @@ CacheBlend의 Fig.12는 RAG 형태의 멀티-document 입력에서 **KV 캐시 �
 cacheblend_fig12/
 ├── README.md                  ← 본 문서
 ├── build_prompts.py           ← 프롬프트 빌드 스크립트 (MuSiQue → prompts.jsonl)
-├── convert_to_cacheblend.py   ← prompts.jsonl → CacheBlend 입력 포맷 변환기 (§8.4 참조)
-├── requirements.txt           ← Python 의존성
-└── prompts.jsonl              ← 결과 (200줄, ~1.2 MB)
+├── prompts.jsonl              ← 결과 (200줄, ~1.2 MB)
+├── requirements.txt           ← Python 의존성 (build + harness)
+└── harness/                   ← HF transformers 기반 평가 하네스 (§8.4 참조)
+    ├── runner.py              ← CacheBlendRunner ABC + FullPrefillRunner (baseline)
+    ├── metrics.py             ← F1, ROUGE-L (YaoJiayi/CacheBlend utils.py에서 포팅)
+    ├── eval.py                ← argparse 기반 메인: 모델·러너·prompts.jsonl 로딩, 루프, 요약 출력
+    └── example_runner.py      ← 사용자가 자신의 CacheBlend 구현을 끼우는 방법 예시
 ```
 
 ## 5. `prompts.jsonl` 레코드 스키마
@@ -262,96 +266,147 @@ def em(pred, golds):
 제한적이라는 점이 CacheBlend가 강조하는 어려움이고, 본 데이터셋은 그 어려움을
 보존합니다.
 
-### 8.4 CacheBlend 공식 스크립트(`example/blend_musique.py`)와 함께 쓰기
+### 8.4 평가 하네스 (`harness/`) — HF transformers 기반 CacheBlend 측정용
 
-[YaoJiayi/CacheBlend](https://github.com/YaoJiayi/CacheBlend) 레포는 vLLM fork와
-함께 `example/blend_musique.py`라는 실험 스크립트를 제공합니다. 이 스크립트는
-**자체 포맷의 JSON**을 기대하므로, `prompts.jsonl`을 변환한 뒤 한 줄만 패치하면
-바로 돌릴 수 있습니다.
+[YaoJiayi/CacheBlend](https://github.com/YaoJiayi/CacheBlend)의 `example/blend_musique.py`
+는 **vLLM fork**에 묶여 있어서 사용자가 직접 다른 백엔드(예: HuggingFace
+transformers) 위에 CacheBlend를 재구현할 때는 그대로 가져다 쓸 수 없습니다.
+`harness/`는 그 실험 루프 구조와 메트릭을 HF transformers 위로 포팅한
+경량 벤치마크입니다. 사용자가 **자신의 CacheBlend 구현을 단일 클래스로 끼워
+넣어** baseline(full-prefill)과 같은 데이터, 같은 모델, 같은 메트릭으로 비교할
+수 있게 만들어졌습니다.
 
-#### 스키마 매핑
+#### 8.4.1 구조
 
-| 항목 | 우리 (`prompts.jsonl`) | CacheBlend (`inputs/musique_*.json`) |
-|---|---|---|
-| 파일 형식 | JSONL | JSON list |
-| 문서 | `prompt_parts.docs[i]` (str) | `ctxs[i] = {"title": str, "text": str}` |
-| 질문 | `question` | `question` |
-| 정답 | `answer` (+ `answer_aliases`) | `answers` (list[str]) |
-
-#### 1단계 — 변환
-
-```bash
-.venv/bin/python convert_to_cacheblend.py \
-  --output /path/to/CacheBlend/inputs/musique_ours.json
+```
+harness/
+├── runner.py          # CacheBlendRunner ABC + FullPrefillRunner (baseline)
+├── metrics.py         # F1, ROUGE-L (YaoJiayi/CacheBlend utils.py에서 포팅)
+├── eval.py            # python -m harness.eval ... 의 메인
+└── example_runner.py  # 사용자 구현용 stub (NotImplementedError로 시작)
 ```
 
-기본 입력은 같은 디렉터리의 `prompts.jsonl`. 출력 레코드 스키마:
+#### 8.4.2 Runner 인터페이스
 
-```json
-{
-  "question": "Who is the spouse of the Green performer?",
-  "answers":  ["Miquette Giraudy"],
-  "ctxs": [
-    {"title": "", "text": "List of show business families. ..."},
-    {"title": "", "text": "Miquette Giraudy. Miquette Giraudy ..."}
-  ]
-}
-```
-
-> `title`은 의도적으로 비웁니다. 우리 docs는 이미 `"{title}. {paragraph_text}"`
-> 형태로 만들어져 있고, CacheBlend의 `build_qa_prompt()`가 다시
-> `f"{title}\n\n{text}\n\n"`로 합치기 때문에, title을 채우면 제목이 두 번
-> 들어갑니다. 빈 title이면 `"\n\n{text}\n\n"`로 깔끔하게 떨어집니다.
->
-> `answers`에는 정답과 `answer_aliases`를 모두 담습니다. CacheBlend의 채점은
-> `max([compute_f1(pred, a, tok) for a in answers])`이므로 alias가 많을수록
-> F1 평가가 정확해집니다.
-
-#### 2단계 — `blend_musique.py` 한 줄 패치
+`harness/runner.py`:
 
 ```python
-# CacheBlend/example/blend_musique.py 의 9번째 줄
-- eval_dataset = load_dataset("inputs/musique_s.json")
-+ eval_dataset = load_dataset("inputs/musique_ours.json")
+class CacheBlendRunner(ABC):
+    def __init__(self, model: PreTrainedModel, tokenizer: PreTrainedTokenizerBase): ...
+
+    @abstractmethod
+    def prepare(self, system: str, docs: list[str], question: str) -> None:
+        """예제마다 한 번 호출. 청크별 prefill·KV 캐시 등 per-example state 세팅."""
+
+    @abstractmethod
+    def generate(self, max_new_tokens: int = 32) -> GenerationResult:
+        """prepare()가 만든 state로 step-decoding. TTFT는 generate() 진입부터 첫 토큰까지."""
 ```
 
-이외에는 손대지 않습니다. 스크립트가 자체적으로:
-- 문서 → `[doc_chunk_ids]`로 토크나이즈
-- Mistral `[INST] / [/INST]` 토큰을 앞뒤에 부착
-- `cache_fuse_metadata['collect'/'check']` 토글로 **CacheBlend (KV 재사용)** 와
-  **vanilla full prefill** 를 같은 입력으로 두 번 돌리고 TTFT, F1 측정
+`GenerationResult = (text, ttft_seconds, total_seconds, n_generated_tokens)`.
 
-#### 3단계 — 실행 (GPU 환경)
+**Runner는 예제 간 재사용됩니다.** 모델·토크나이저는 한 번 로드하고, 200개
+예제에 대해 `prepare → generate` 사이클을 200번 돕니다. 그래서 `prepare()`
+구현은 매번 이전 KV 등을 깨끗이 갈아끼워야 합니다.
+
+#### 8.4.3 Baseline — `FullPrefillRunner`
+
+`runner.py`에 함께 들어 있는 참조 구현. `system + docs + question`을 한
+프롬프트로 합쳐 한 번에 prefill하고, `past_key_values`를 들고 step-decode
+하면서 첫 토큰 시점까지의 시간을 TTFT로 잽니다.
+
+이게 **정확히 사용자 CacheBlend가 이겨야 할 baseline TTFT**입니다 — 같은
+입력으로 KV 재사용 없이 정직하게 forward한 비용.
+
+#### 8.4.4 자기 구현 끼워 넣기
+
+`harness/example_runner.py`를 복사해서 본인 패키지에 두고, 두 메서드를
+채운 뒤 dotted spec으로 `--runner`에 넘겨줍니다.
+
+```python
+# my_pkg/my_cb.py
+from harness.runner import CacheBlendRunner, GenerationResult
+
+class MyCacheBlend(CacheBlendRunner):
+    def prepare(self, system, docs, question):
+        # 1) system, 각 doc, question을 따로 토크나이즈
+        # 2) 청크별로 forward → 레이어별 KV 추출 → per-chunk cache 테이블에 저장
+        # 3) 청크 KV를 stitch (position id 보정, 레이어별 blend, top-k refresh 등)
+        # 4) self.{stitched_past, question_ids}에 보관
+        ...
+
+    def generate(self, max_new_tokens=32):
+        # self.stitched_past를 past_key_values로 주입한 step-decode
+        # TTFT는 이 함수 진입부터 첫 토큰 직후까지 측정
+        ...
+```
+
+> 사용자 구현이 짊어지는 핵심 책임은 **(a)** 청크 KV 추출/저장, **(b)** 청크
+> KV stitching (position·attention 정합), **(c)** generate() 시점의 TTFT가
+> 정직하게 줄어들도록 (a)/(b)가 측정 외부에서 끝나 있을 것 — 입니다.
+
+#### 8.4.5 실행
 
 ```bash
-cd /path/to/CacheBlend
-# vllm_blend 설치는 그쪽 README 참조
-python example/blend_musique.py
+# 환경 (build_prompts.py와 venv 공유)
+uv pip install --python .venv/bin/python -r requirements.txt
+
+# baseline만 (default 러너)
+.venv/bin/python -m harness.eval \
+    --model mistralai/Mistral-7B-Instruct-v0.2 \
+    --n 200
+
+# baseline vs 본인 구현 비교
+.venv/bin/python -m harness.eval \
+    --model mistralai/Mistral-7B-Instruct-v0.2 \
+    --runner harness.runner:FullPrefillRunner \
+    --runner my_pkg.my_cb:MyCacheBlend \
+    --n 200 \
+    --report results.jsonl
 ```
 
-기대 출력 끝부분:
+기본값:
+
+| 옵션 | 기본값 |
+|---|---|
+| `--prompts` | `./prompts.jsonl` (스크립트 기준 상대) |
+| `--model` | `mistralai/Mistral-7B-Instruct-v0.2` |
+| `--runner` | `harness.runner:FullPrefillRunner` (반복 가능) |
+| `--n` | 전체 |
+| `--max-new-tokens` | 32 |
+| `--device` | `auto` (cuda → mps → cpu) |
+| `--dtype` | `float16` (CPU에서는 자동 float32) |
+| `--report` | 없음 (지정 시 per-example 결과를 JSONL로) |
+
+요약 출력 예:
 
 ```
----------------Result Summary---------------------
-TTFT with cache: <초>
-TTFT with full prefill: <초>
-F1 with cache: <0~1>
-F1 with full prefill: <0~1>
+--- summary ---
+runner                            TTFT(s)       F1  ROUGE-L   tok/ex
+FullPrefillRunner                   1.823    0.412    0.451     14.2
+MyCacheBlend                        0.214    0.398    0.439     14.0
 ```
 
-#### 주의
+`--report`로 받는 JSONL 한 줄에는
+`{id, runner, ttft, total, n_tokens, pred, golds, f1, rouge_l}`이 들어갑니다 —
+사후 분석/플로팅용.
 
-- **모델 고정**: `mistralai/Mistral-7B-Instruct-v0.2`. 다른 모델로 바꾸려면
-  `blend_musique.py` L46/L54의 `[INST]`/`[/INST]` 토큰 ID(`[733, 16289, 28793]`,
-  `[733, 28748, 16289, 28793]`)를 해당 토크나이저로 다시 인코딩해야 합니다.
-- **시스템 프롬프트는 CacheBlend 원본을 사용**: §3에서 정한 우리 시스템 프롬프트
-  (`"You are a helpful assistant. Use the following documents to answer the question."`)
-  는 이 경로에서 사용되지 않습니다. CacheBlend 측 `prefix_prompt`/`query_prompt`
-  (`blend_musique.py` L17-18)가 적용됩니다 — 즉 `prompts.jsonl`의 `prompt` 필드 자체가
-  아니라 docs/question/answer만 재사용됩니다. 같은 시스템 프롬프트로 통일하고 싶다면
-  L17-18을 우리 문구로 직접 교체하세요.
-- **GPU 필요**: vLLM이 macOS에서는 동작하지 않습니다. 변환·패치까지가 로컬에서
-  가능한 범위.
+#### 8.4.6 YaoJiayi 원본과의 매핑
+
+| YaoJiayi/CacheBlend | 본 하네스 | 비고 |
+|---|---|---|
+| `example/blend_musique.py` 메인 루프 | `harness/eval.py` | argparse·모듈 임포트로 구조화 |
+| `cache_fuse_metadata` dict 토글 | `CacheBlendRunner` 서브클래스 | "검사 vs 수집" 구분이 클래스 책임으로 들어감 |
+| `model.layers[j].self_attn.hack_kv` | (사용자 구현 영역) | HF에서는 forward 후 `past_key_values`를 직접 다룸 |
+| `model.old_kvs` 주입 | (사용자 구현 영역) | HF에서는 `past_key_values=...`로 주입 |
+| `compute_f1` (utils.py) | `harness/metrics.py:compute_f1` | 토큰화 기반 F1, max-over-aliases 동일 |
+| `prefix_prompt` / `query_prompt` (Mistral [INST]) | `_format_prompt` (raw concat) | §3에서 정한 우리 시스템 프롬프트 사용. 변경하려면 `runner.py`의 템플릿 수정 |
+| 모델 하드코딩 | `--model` 인자 | 기본은 동일하게 Mistral-7B-Instruct-v0.2 |
+
+> **중요**: YaoJiayi 원본은 Mistral `[INST]/[/INST]` 토큰을 raw로 박아 넣습니다.
+> 본 하네스 baseline은 그렇게 하지 않고 `prompts.jsonl`이 가진 시스템 프롬프트를
+> 그대로 텍스트로 합칩니다. 동일 모델에서 두 setup의 baseline F1이 다를 수 있는데,
+> *상대 비교 (baseline 대비 자기 구현의 F1·TTFT)*는 같은 하네스 안에서만 유효합니다.
 
 ## 9. 파라미터를 바꾸고 싶다면
 
